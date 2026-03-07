@@ -36,9 +36,21 @@ docker compose up --build
 
 ### Portainer
 
-1. Create a new stack with the `docker-compose.yml` contents
+1. Create a new stack pointing to this repo (or paste the `docker-compose.yml` contents)
 2. Set environment variables in the stack config
-3. Use Portainer's job scheduler to run on a cron schedule (e.g., every 2 hours)
+3. Deploy — the sync runs once immediately, then daily at 7:00 PM via the Ofelia sidecar
+
+## Scheduling
+
+Scheduling is handled by [Ofelia](https://github.com/mcuadros/ofelia), a Docker-based job scheduler included as a sidecar in `docker-compose.yml`. It runs the sync container daily at 19:00 (server time).
+
+The schedule is configured via labels on the `f45-gfit-sync` service. To change it, edit the cron expression in `docker-compose.yml`:
+
+```yaml
+ofelia.job-run.sync.schedule: "0 0 19 * * *"
+```
+
+Ofelia uses a 6-field cron format: `second minute hour day month weekday`.
 
 ## How It Works
 
