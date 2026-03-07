@@ -1,0 +1,14 @@
+services:
+  f45-gfit-sync:
+    build: .
+    environment:
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REFRESH_TOKEN=${GOOGLE_REFRESH_TOKEN}
+      - LOCAL_TIMEZONE=${LOCAL_TIMEZONE:-America/Denver}
+    volumes:
+      - sync-data:/data
+    restart: "no"
+
+volumes:
+  sync-data:
