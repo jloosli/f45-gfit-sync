@@ -11,7 +11,7 @@ services:
       - sync-data:/data
     labels:
       ofelia.enabled: "true"
-      ofelia.job-exec.sync.schedule: "0 0 19 * * *"
+      ofelia.job-exec.sync.schedule: "0 0 7-19 * * *"
       ofelia.job-exec.sync.command: "python -u sync.py"
       ofelia.job-exec.sync.no-overlap: "true"
     restart: unless-stopped
