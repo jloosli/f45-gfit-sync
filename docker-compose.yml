@@ -1,6 +1,7 @@
 services:
   f45-gfit-sync:
     build: .
+    command: ["tail", "-f", "/dev/null"]
     environment:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
@@ -10,14 +11,13 @@ services:
       - sync-data:/data
     labels:
       ofelia.enabled: "true"
-      ofelia.job-run.sync.schedule: "0 0 19 * * *"
-      ofelia.job-run.sync.no-overlap: "true"
-    restart: "no"
+      ofelia.job-exec.sync.schedule: "0 0 19 * * *"
+      ofelia.job-exec.sync.command: "python -u sync.py"
+      ofelia.job-exec.sync.no-overlap: "true"
+    restart: unless-stopped
 
   ofelia:
     image: mcuadros/ofelia:latest
-    depends_on:
-      - f45-gfit-sync
     command: daemon --docker
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
