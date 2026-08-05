@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Sync F45 Lionheart workout data from Gmail to Google Fit."""
+"""Sync F45 Lionheart workout data from Gmail to Google Health.
+
+Google Fit's REST API is deprecated (end of 2026). This writes to the Google
+Health API instead: POST /v4/users/me/dataTypes/exercise/dataPoints.
+
+Docs: https://developers.google.com/health/reference/rest/v4/users.dataTypes.dataPoints
+"""
 
 import json
 import logging
 import os
 import re
 import sys
-import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -20,15 +25,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
-FIT_API = "https://www.googleapis.com/fitness/v1/users/me"
+HEALTH_API = "https://health.googleapis.com/v4/users/me"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 
-PROJECT_NUMBER = "415791213904"
-APP_NAME = "f45_lionheart_sync"
-ACTIVITY_DS = f"raw:com.google.activity.segment:{PROJECT_NUMBER}:{APP_NAME}"
-CALORIES_DS = f"raw:com.google.calories.expended:{PROJECT_NUMBER}:{APP_NAME}_calories"
+# Google Health data type written to (kebab-case path segment).
+EXERCISE_DATA_TYPE = "exercise"
+
+# Exercise.ExerciseType enum. F45 is closest to HIIT; BOOTCAMP and
+# CIRCUIT_TRAINING are also valid values if you prefer one of those.
+DEFAULT_EXERCISE_TYPE = "HIGH_INTENSITY_INTERVAL_TRAINING"
+
+CLASS_DURATION_MIN = 45
 
 STATE_PATH = os.environ.get("STATE_PATH", "/data/sync_state.json")
+DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
@@ -40,7 +50,9 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
     }, timeout=30)
     if resp.status_code != 200:
         log.error("Token refresh failed (%d): %s", resp.status_code, resp.text)
-        log.error("Your refresh token may have expired. Re-run the OAuth flow to get a new one.")
+        log.error("Re-run get_refresh_token.py to mint a new one. Note: if your OAuth "
+                  "consent screen is still in Testing status, refresh tokens expire "
+                  "after 7 days -- publish the app to Production to avoid that.")
         sys.exit(1)
     token = resp.json().get("access_token")
     if not token:
@@ -102,6 +114,12 @@ def get_email(access_token: str, msg_id: str) -> dict | None:
     return resp.json()
 
 
+def _utc_offset_duration(dt: datetime) -> str:
+    """Google Health wants UTC offsets as a protobuf Duration string, e.g. '-21600s'."""
+    offset = dt.utcoffset() or timedelta(0)
+    return f"{int(offset.total_seconds())}s"
+
+
 def parse_workout(snippet: str, internal_date_ms: int, tz: ZoneInfo) -> dict | None:
     summary_match = re.search(
         r"Your\s+(\d{1,2}:\d{2}\s*[AP]M)\s+(.+?)\s+class\s+at\s+(.+?)\s+summary",
@@ -135,7 +153,7 @@ def parse_workout(snippet: str, internal_date_ms: int, tz: ZoneInfo) -> dict | N
     if start_dt > email_dt:
         start_dt -= timedelta(days=1)
 
-    end_dt = start_dt + timedelta(minutes=45)
+    end_dt = start_dt + timedelta(minutes=CLASS_DURATION_MIN)
 
     return {
         "class_name": class_name,
@@ -144,15 +162,16 @@ def parse_workout(snippet: str, internal_date_ms: int, tz: ZoneInfo) -> dict | N
         "points": points,
         "avg_bpm": avg_bpm,
         "max_bpm": max_bpm,
-        "start_ms": int(start_dt.timestamp() * 1000),
-        "end_ms": int(end_dt.timestamp() * 1000),
-        "start_ns": str(int(start_dt.timestamp() * 1_000_000_000)),
-        "end_ns": str(int(end_dt.timestamp() * 1_000_000_000)),
+        "duration_s": CLASS_DURATION_MIN * 60,
+        "start_rfc3339": start_dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_rfc3339": end_dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "start_utc_offset": _utc_offset_duration(start_dt),
+        "end_utc_offset": _utc_offset_duration(end_dt),
         "dedup_key": f"{start_dt.date()}|{class_time_str}|{class_name}",
     }
 
 
-def calculate_calories(avg_bpm: int, points: int, duration_min: int = 45) -> int:
+def calculate_calories(avg_bpm: int, points: int, duration_min: int = CLASS_DURATION_MIN) -> int:
     # Keytel formula (male, weight=120.2kg, age=51)
     cal_per_min = (-55.0969 + 0.6309 * avg_bpm + 0.1988 * 120.2 + 0.2017 * 51) / 4.184
     base_calories = max(0, cal_per_min * duration_min)
@@ -160,117 +179,83 @@ def calculate_calories(avg_bpm: int, points: int, duration_min: int = 45) -> int
     return round(base_calories * intensity_scale)
 
 
-def ensure_fit_data_sources(access_token: str) -> None:
-    sources = [
-        {
-            "dataStreamId": ACTIVITY_DS,
-            "dataStreamName": APP_NAME,
-            "type": "raw",
-            "application": {"name": "F45 Lionheart Sync"},
-            "dataType": {"name": "com.google.activity.segment"},
-        },
-        {
-            "dataStreamId": CALORIES_DS,
-            "dataStreamName": f"{APP_NAME}_calories",
-            "type": "raw",
-            "application": {"name": "F45 Lionheart Sync"},
-            "dataType": {"name": "com.google.calories.expended"},
-        },
-    ]
-    for src in sources:
-        resp = requests.post(
-            f"{FIT_API}/dataSources",
-            headers={**auth_headers(access_token), "Content-Type": "application/json"},
-            json=src,
-            timeout=30,
-        )
-        if resp.status_code in (200, 201):
-            log.info("Created data source: %s", src["dataStreamId"])
-        elif resp.status_code == 409:
-            log.debug("Data source already exists: %s", src["dataStreamId"])
-        else:
-            log.error("Failed to create data source %s (%d): %s",
-                       src["dataStreamId"], resp.status_code, resp.text)
-            raise RuntimeError(f"Data source creation failed: {src['dataStreamId']}")
+def build_exercise_datapoint(workout: dict, calories: int, exercise_type: str) -> dict:
+    """Build a DataPoint with the `exercise` union field set.
 
-
-def _patch_dataset(access_token: str, data_source_id: str, start_ns: str, end_ns: str,
-                   value_key: str, value) -> None:
-    dataset_id = f"{start_ns}-{end_ns}"
-    url = f"{FIT_API}/dataSources/{data_source_id}/datasets/{dataset_id}"
-    body = {
-        "dataSourceId": data_source_id,
-        "minStartTimeNs": start_ns,
-        "maxEndTimeNs": end_ns,
-        "point": [{
-            "dataTypeName": data_source_id.split(":")[1],
-            "startTimeNanos": start_ns,
-            "endTimeNanos": end_ns,
-            "value": [{value_key: value}],
-        }],
+    Field names follow the v4 Exercise / MetricsSummary schemas. Only calories and
+    average heart rate are sent as metrics -- max BPM and Lionheart points have no
+    dedicated fields, so they ride along in `notes`.
+    """
+    return {
+        "exercise": {
+            "interval": {
+                "startTime": workout["start_rfc3339"],
+                "startUtcOffset": workout["start_utc_offset"],
+                "endTime": workout["end_rfc3339"],
+                "endUtcOffset": workout["end_utc_offset"],
+            },
+            "exerciseType": exercise_type,
+            "displayName": f"F45 {workout['class_name']}",
+            "activeDuration": f"{workout['duration_s']}s",
+            "metricsSummary": {
+                "caloriesKcal": float(calories),
+                "averageHeartRateBeatsPerMinute": workout["avg_bpm"],
+            },
+            "notes": (
+                f"{workout['class_name']} at {workout['studio']} - "
+                f"{workout['points']} pts, {workout['avg_bpm']} avg BPM, "
+                f"{workout['max_bpm']} max BPM, {calories} cal"
+            ),
+        }
     }
-    resp = requests.patch(
+
+
+def log_to_google_health(access_token: str, workout: dict, calories: int,
+                         exercise_type: str) -> None:
+    payload = build_exercise_datapoint(workout, calories, exercise_type)
+
+    if DRY_RUN:
+        log.info("DRY_RUN -- would POST:\n%s", json.dumps(payload, indent=2))
+        return
+
+    url = f"{HEALTH_API}/dataTypes/{EXERCISE_DATA_TYPE}/dataPoints"
+    resp = requests.post(
         url,
         headers={**auth_headers(access_token), "Content-Type": "application/json"},
-        json=body,
+        json=payload,
         timeout=30,
     )
     if resp.status_code not in (200, 201):
-        log.error("Failed to patch dataset %s (%d): %s", dataset_id, resp.status_code, resp.text)
-        raise RuntimeError(f"Dataset patch failed for {data_source_id}")
+        log.error("Failed to create exercise data point (%d): %s",
+                  resp.status_code, resp.text)
+        if resp.status_code == 400 and "exerciseType" in resp.text:
+            log.error("Try a different EXERCISE_TYPE (e.g. BOOTCAMP, CIRCUIT_TRAINING, "
+                      "STRENGTH_TRAINING, WORKOUT).")
+        if resp.status_code == 403:
+            log.error("403 usually means the googlehealth activity_and_fitness writeonly "
+                      "scope is missing from your token, or the API is not enabled on the "
+                      "Cloud project.")
+        raise RuntimeError("Exercise data point creation failed")
 
-
-def log_to_google_fit(access_token: str, workout: dict, calories: int) -> None:
-    # Activity segment (HIIT = 113)
-    _patch_dataset(access_token, ACTIVITY_DS,
-                   workout["start_ns"], workout["end_ns"], "intVal", 113)
-    log.info("Logged activity segment")
-
-    # Calories
-    _patch_dataset(access_token, CALORIES_DS,
-                   workout["start_ns"], workout["end_ns"], "fpVal", float(calories))
-    log.info("Logged calories: %d", calories)
-
-    # Session
-    session_id = f"f45_lionheart_{workout['start_ms']}"
-    session_body = {
-        "id": session_id,
-        "name": f"F45 {workout['class_name']}",
-        "description": (
-            f"{workout['class_name']} at {workout['studio']} - "
-            f"{workout['points']} pts, {workout['avg_bpm']} avg BPM, "
-            f"{calories} cal"
-        ),
-        "startTimeMillis": workout["start_ms"],
-        "endTimeMillis": workout["end_ms"],
-        "activityType": 113,
-        "application": {"name": "F45 Lionheart Sync"},
-    }
-    resp = requests.put(
-        f"{FIT_API}/sessions/{session_id}",
-        headers={**auth_headers(access_token), "Content-Type": "application/json"},
-        json=session_body,
-        timeout=30,
-    )
-    if resp.status_code not in (200, 201):
-        log.error("Failed to create session (%d): %s", resp.status_code, resp.text)
-        raise RuntimeError("Session creation failed")
-    log.info("Created session: %s", session_id)
+    created = resp.json().get("name", "(unnamed)")
+    log.info("Created exercise data point: %s (%d cal, %d avg BPM)",
+             created, calories, workout["avg_bpm"])
 
 
 def main():
-    # Read env vars
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
     tz_name = os.environ.get("LOCAL_TIMEZONE", "America/Denver")
+    exercise_type = os.environ.get("EXERCISE_TYPE", DEFAULT_EXERCISE_TYPE)
 
     if not all([client_id, client_secret, refresh_token]):
         log.error("Missing required env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN")
         sys.exit(1)
 
     tz = ZoneInfo(tz_name)
-    log.info("Starting F45 Lionheart to Google Fit sync (tz=%s)", tz_name)
+    log.info("Starting F45 Lionheart to Google Health sync (tz=%s, type=%s%s)",
+             tz_name, exercise_type, ", DRY_RUN" if DRY_RUN else "")
 
     access_token = refresh_access_token(client_id, client_secret, refresh_token)
     state = load_state(STATE_PATH)
@@ -281,7 +266,6 @@ def main():
     new_msgs = [m for m in messages if m["id"] not in processed_ids]
     log.info("%d new message(s) to process", len(new_msgs))
 
-    data_sources_ensured = False
     synced = 0
     skipped = 0
 
@@ -310,14 +294,14 @@ def main():
         calories = calculate_calories(workout["avg_bpm"], workout["points"])
 
         try:
-            if not data_sources_ensured:
-                ensure_fit_data_sources(access_token)
-                data_sources_ensured = True
-
-            log_to_google_fit(access_token, workout, calories)
+            log_to_google_health(access_token, workout, calories, exercise_type)
         except RuntimeError as e:
             log.error("Failed to sync workout %s: %s", workout["dedup_key"], e)
             skipped += 1
+            continue
+
+        if DRY_RUN:
+            synced += 1
             continue
 
         # Mark processed
