@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["requests"]
+# ///
 """Sync F45 Lionheart workout data from Gmail to Google Health.
 
 Google Fit's REST API is deprecated (end of 2026). This writes to the Google
@@ -31,9 +35,16 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 # Google Health data type written to (kebab-case path segment).
 EXERCISE_DATA_TYPE = "exercise"
 
-# Exercise.ExerciseType enum. F45 is closest to HIIT; BOOTCAMP and
-# CIRCUIT_TRAINING are also valid values if you prefer one of those.
-DEFAULT_EXERCISE_TYPE = "HIGH_INTENSITY_INTERVAL_TRAINING"
+# Exercise.ExerciseType enum. HIIT matches the activityType 113 this used to send
+# to Google Fit. Also accepted (verified with probe_exercise_types.py): BOOTCAMP,
+# CIRCUIT_TRAINING, INTERVAL_WORKOUT, AEROBIC_WORKOUT, WORKOUT, CROSS_TRAINING,
+# FUNCTIONAL_STRENGTH_TRAINING, STRENGTH_TRAINING, CROSSFIT, WEIGHTS,
+# WEIGHTLIFTING, CALISTHENICS, SPORT, OTHER.
+DEFAULT_EXERCISE_TYPE = "HIIT"
+
+# dataSource.recordingMethod -- the BPM and points come off a real Lionheart strap
+# during a tracked class, so this is actively measured rather than hand-entered.
+RECORDING_METHOD = "ACTIVELY_MEASURED"
 
 CLASS_DURATION_MIN = 45
 
@@ -41,7 +52,8 @@ STATE_PATH = os.environ.get("STATE_PATH", "/data/sync_state.json")
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 
-def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
+def refresh_access_token(client_id: str, client_secret: str, refresh_token: str,
+                         label: str) -> str:
     resp = requests.post(TOKEN_URL, data={
         "client_id": client_id,
         "client_secret": client_secret,
@@ -49,16 +61,17 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
         "grant_type": "refresh_token",
     }, timeout=30)
     if resp.status_code != 200:
-        log.error("Token refresh failed (%d): %s", resp.status_code, resp.text)
-        log.error("Re-run get_refresh_token.py to mint a new one. Note: if your OAuth "
-                  "consent screen is still in Testing status, refresh tokens expire "
-                  "after 7 days -- publish the app to Production to avoid that.")
+        log.error("%s token refresh failed (%d): %s", label, resp.status_code, resp.text)
+        log.error("Re-run `get_refresh_token.py %s` to mint a new one. Note: if your "
+                  "OAuth consent screen is still in Testing status, refresh tokens "
+                  "expire after 7 days -- publish the app to Production to avoid that.",
+                  label)
         sys.exit(1)
     token = resp.json().get("access_token")
     if not token:
-        log.error("No access_token in response: %s", resp.text)
+        log.error("No access_token in %s response: %s", label, resp.text)
         sys.exit(1)
-    log.info("Access token refreshed successfully")
+    log.info("%s access token refreshed successfully", label)
     return token
 
 
@@ -187,6 +200,7 @@ def build_exercise_datapoint(workout: dict, calories: int, exercise_type: str) -
     dedicated fields, so they ride along in `notes`.
     """
     return {
+        "dataSource": {"recordingMethod": RECORDING_METHOD},
         "exercise": {
             "interval": {
                 "startTime": workout["start_rfc3339"],
@@ -228,36 +242,65 @@ def log_to_google_health(access_token: str, workout: dict, calories: int,
     if resp.status_code not in (200, 201):
         log.error("Failed to create exercise data point (%d): %s",
                   resp.status_code, resp.text)
-        if resp.status_code == 400 and "exerciseType" in resp.text:
-            log.error("Try a different EXERCISE_TYPE (e.g. BOOTCAMP, CIRCUIT_TRAINING, "
-                      "STRENGTH_TRAINING, WORKOUT).")
-        if resp.status_code == 403:
-            log.error("403 usually means the googlehealth activity_and_fitness writeonly "
-                      "scope is missing from your token, or the API is not enabled on the "
-                      "Cloud project.")
+        if resp.status_code == 400 and "exercise_type" in resp.text:
+            log.error("Invalid EXERCISE_TYPE. Accepted values include HIIT, BOOTCAMP, "
+                      "CIRCUIT_TRAINING, INTERVAL_WORKOUT, AEROBIC_WORKOUT, WORKOUT, "
+                      "CROSS_TRAINING, STRENGTH_TRAINING, OTHER. Run "
+                      "probe_exercise_types.py to test others.")
+        if resp.status_code == 403 and "DISALLOWED_OAUTH_SCOPES" in resp.text:
+            log.error("The health token carries scopes the Health API refuses (it will "
+                      "not accept a token that also holds Gmail scopes). Mint a "
+                      "health-only token: `get_refresh_token.py health`.")
+        elif resp.status_code == 403:
+            log.error("403 can mean the googlehealth activity_and_fitness writeonly scope "
+                      "is missing from the token, or the Google Health API is not enabled "
+                      "on the Cloud project that owns your OAuth client.")
         raise RuntimeError("Exercise data point creation failed")
 
-    created = resp.json().get("name", "(unnamed)")
-    log.info("Created exercise data point: %s (%d cal, %d avg BPM)",
-             created, calories, workout["avg_bpm"])
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    created = body.get("name") or body.get("dataPoint", {}).get("name")
+    if created:
+        log.info("Created exercise data point: %s (%d cal, %d avg BPM)",
+                 created, calories, workout["avg_bpm"])
+    else:
+        # No name field in the response -- log the shape so the ID can be recovered.
+        log.info("Created exercise data point (%d cal, %d avg BPM); response: %s",
+                 calories, workout["avg_bpm"], json.dumps(body)[:400] or "(empty)")
 
 
 def main():
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
+    gmail_refresh = os.environ.get("GOOGLE_REFRESH_TOKEN_GMAIL")
+    health_refresh = os.environ.get("GOOGLE_REFRESH_TOKEN_HEALTH")
     tz_name = os.environ.get("LOCAL_TIMEZONE", "America/Denver")
     exercise_type = os.environ.get("EXERCISE_TYPE", DEFAULT_EXERCISE_TYPE)
 
-    if not all([client_id, client_secret, refresh_token]):
-        log.error("Missing required env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN")
+    if os.environ.get("GOOGLE_REFRESH_TOKEN") and not (gmail_refresh and health_refresh):
+        log.error("GOOGLE_REFRESH_TOKEN is no longer used. The Google Health API rejects "
+                  "tokens that also carry Gmail scopes, so this now needs two separate "
+                  "tokens: GOOGLE_REFRESH_TOKEN_GMAIL and GOOGLE_REFRESH_TOKEN_HEALTH. "
+                  "Mint them with `get_refresh_token.py gmail` and "
+                  "`get_refresh_token.py health`.")
+        sys.exit(1)
+
+    if not all([client_id, client_secret, gmail_refresh, health_refresh]):
+        log.error("Missing required env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, "
+                  "GOOGLE_REFRESH_TOKEN_GMAIL, GOOGLE_REFRESH_TOKEN_HEALTH")
         sys.exit(1)
 
     tz = ZoneInfo(tz_name)
     log.info("Starting F45 Lionheart to Google Health sync (tz=%s, type=%s%s)",
              tz_name, exercise_type, ", DRY_RUN" if DRY_RUN else "")
 
-    access_token = refresh_access_token(client_id, client_secret, refresh_token)
+    access_token = refresh_access_token(client_id, client_secret, gmail_refresh, "gmail")
+    health_token = (
+        refresh_access_token(client_id, client_secret, health_refresh, "health")
+        if not DRY_RUN else ""
+    )
     state = load_state(STATE_PATH)
     processed_ids = set(state.get("processed_ids", []))
     synced_keys = set(state.get("synced_workouts", []))
@@ -294,7 +337,7 @@ def main():
         calories = calculate_calories(workout["avg_bpm"], workout["points"])
 
         try:
-            log_to_google_health(access_token, workout, calories, exercise_type)
+            log_to_google_health(health_token, workout, calories, exercise_type)
         except RuntimeError as e:
             log.error("Failed to sync workout %s: %s", workout["dedup_key"], e)
             skipped += 1
