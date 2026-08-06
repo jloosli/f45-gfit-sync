@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["requests"]
+# ///
 """Offline checks for parsing and Google Health payload construction.
 
-    python3 test_payload.py
+    uv run test_payload.py
 
-No network, no credentials. Exits non-zero on failure.
+No network, no credentials. Exits non-zero on failure. `requests` is declared
+because importing `sync` pulls it in, not because anything here makes a request.
 """
 
 import json
