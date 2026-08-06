@@ -242,7 +242,9 @@ def log_to_google_health(access_token: str, workout: dict, calories: int,
     if resp.status_code not in (200, 201):
         log.error("Failed to create exercise data point (%d): %s",
                   resp.status_code, resp.text)
-        if resp.status_code == 400 and "exercise_type" in resp.text:
+        if resp.status_code == 400 and (
+            "exercise_type" in resp.text or "exerciseType" in resp.text
+        ):
             log.error("Invalid EXERCISE_TYPE. Accepted values include HIIT, BOOTCAMP, "
                       "CIRCUIT_TRAINING, INTERVAL_WORKOUT, AEROBIC_WORKOUT, WORKOUT, "
                       "CROSS_TRAINING, STRENGTH_TRAINING, OTHER. Run "
@@ -329,9 +331,10 @@ def main():
         # Dedup check
         if workout["dedup_key"] in synced_keys:
             log.info("Skipping duplicate workout: %s", workout["dedup_key"])
-            processed_ids.add(msg_id)
-            state["processed_ids"] = list(processed_ids)
-            save_state(STATE_PATH, state)
+            if not DRY_RUN:
+                processed_ids.add(msg_id)
+                state["processed_ids"] = list(processed_ids)
+                save_state(STATE_PATH, state)
             continue
 
         calories = calculate_calories(workout["avg_bpm"], workout["points"])

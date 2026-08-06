@@ -57,10 +57,13 @@ CANDIDATES = [
 def refresh_access_token() -> str:
     cid = os.environ.get("GOOGLE_CLIENT_ID")
     secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN")
+    # Health-only token: the Health API refuses a token that also carries Gmail
+    # scopes, so the legacy combined GOOGLE_REFRESH_TOKEN is not a usable fallback.
+    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN_HEALTH")
     if not all([cid, secret, refresh]):
-        print("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN",
-              file=sys.stderr)
+        print("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / "
+              "GOOGLE_REFRESH_TOKEN_HEALTH. Mint the health token with "
+              "`get_refresh_token.py health`.", file=sys.stderr)
         sys.exit(1)
     resp = requests.post(TOKEN_URL, data={
         "client_id": cid, "client_secret": secret,
