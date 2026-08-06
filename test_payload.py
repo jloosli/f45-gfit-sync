@@ -62,10 +62,11 @@ payload = build_exercise_datapoint(workout, calories, DEFAULT_EXERCISE_TYPE)
 ex = payload["exercise"]
 
 print("\nbuild_exercise_datapoint")
-check("single union field", list(payload.keys()) == ["exercise"])
+check("top-level keys", set(payload) == {"dataSource", "exercise"})
+check("recordingMethod", payload["dataSource"]["recordingMethod"] == "ACTIVELY_MEASURED")
 check("interval keys",
       set(ex["interval"]) == {"startTime", "startUtcOffset", "endTime", "endUtcOffset"})
-check("exerciseType", ex["exerciseType"] == "HIGH_INTENSITY_INTERVAL_TRAINING")
+check("exerciseType", ex["exerciseType"] == "HIIT", ex["exerciseType"])
 check("displayName", ex["displayName"] == "F45 Athletica", ex["displayName"])
 check("activeDuration is a Duration", ex["activeDuration"] == "2700s", ex["activeDuration"])
 check("calories metric", ex["metricsSummary"]["caloriesKcal"] == float(calories))

@@ -25,14 +25,27 @@ All `googlehealth.*` scopes are classified **Restricted**. An unverified client 
 capped at 100 users, which is plenty for personal use — a third-party security
 review is only required beyond that.
 
-## Getting a Refresh Token
+## Getting Refresh Tokens
+
+**Two tokens are required.** The Google Health API rejects any access token that
+carries scopes outside `googlehealth.*` — a combined Gmail + Health token fails with
+`403 DISALLOWED_OAUTH_SCOPES` (`disallowed_scopes: mail_readonly`). Same OAuth
+client, two separate consent flows:
 
 ```bash
-GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... python3 get_refresh_token.py
+set -a; source .env; set +a
+uv run get_refresh_token.py health   # -> GOOGLE_REFRESH_TOKEN_HEALTH
+uv run get_refresh_token.py gmail    # -> GOOGLE_REFRESH_TOKEN_GMAIL
 ```
 
-Follow the printed URL, approve both scopes, then paste the `code` value from the
-resulting `https://www.google.com/?code=...` URL.
+Follow each printed URL, approve the scope, then paste the `code` value from the
+resulting `https://www.google.com/?code=...` URL. The script prints the granted
+scope set and warns if the token came back contaminated with extra scopes — if it
+does, revoke the app at https://myaccount.google.com/permissions and retry.
+
+The scripts carry PEP 723 inline metadata, so `uv run` resolves `requests` on its
+own — no venv to create. Without uv: `python3 -m venv .venv &&
+.venv/bin/pip install -r requirements.txt && .venv/bin/python get_refresh_token.py health`.
 
 > **Publish the consent screen to Production.** While it sits in *Testing* status,
 > Google issues refresh tokens that expire after **7 days** — the nightly job will
@@ -47,14 +60,25 @@ Set these environment variables (via `.env` file or Portainer stack config):
 |----------|----------|---------|-------------|
 | `GOOGLE_CLIENT_ID` | Yes | | OAuth client ID |
 | `GOOGLE_CLIENT_SECRET` | Yes | | OAuth client secret |
-| `GOOGLE_REFRESH_TOKEN` | Yes | | OAuth refresh token |
+| `GOOGLE_REFRESH_TOKEN_GMAIL` | Yes | | Refresh token holding only `gmail.readonly` |
+| `GOOGLE_REFRESH_TOKEN_HEALTH` | Yes | | Refresh token holding only the googlehealth writeonly scope |
 | `LOCAL_TIMEZONE` | No | `America/Denver` | Timezone for workout time calculation |
-| `EXERCISE_TYPE` | No | `HIGH_INTENSITY_INTERVAL_TRAINING` | `Exercise.ExerciseType` enum value |
+| `EXERCISE_TYPE` | No | `HIIT` | `Exercise.ExerciseType` enum value |
 | `DRY_RUN` | No | | Set to `1` to print the payload instead of writing |
 | `STATE_PATH` | No | `/data/sync_state.json` | State file location |
 
-Other plausible `EXERCISE_TYPE` values: `BOOTCAMP`, `CIRCUIT_TRAINING`,
-`STRENGTH_TRAINING`, `WORKOUT`.
+Google's docs don't publish the full `Exercise.ExerciseType` enum, so
+`probe_exercise_types.py` determines it empirically — it pairs each candidate with
+a deliberately invalid `recordingMethod` so the request always fails at parse time
+and never writes, then reads the `fieldViolations` to see which field was rejected.
+
+Verified accepted: `HIIT`, `BOOTCAMP`, `CIRCUIT_TRAINING`, `INTERVAL_WORKOUT`,
+`AEROBIC_WORKOUT`, `WORKOUT`, `CROSS_TRAINING`, `FUNCTIONAL_STRENGTH_TRAINING`,
+`STRENGTH_TRAINING`, `CROSSFIT`, `WEIGHTS`, `WEIGHTLIFTING`, `CALISTHENICS`,
+`SPORT`, `OTHER`, `RUNNING`.
+
+Verified rejected: `HIGH_INTENSITY_INTERVAL_TRAINING`, `BOOT_CAMP`,
+`MIXED_CARDIO`, `GYM`, `INDOOR_WORKOUT`.
 
 ## Running
 
@@ -68,7 +92,8 @@ docker compose up --build
 ### Dry run
 
 ```bash
-DRY_RUN=1 STATE_PATH=/tmp/state.json python3 sync.py
+set -a; source .env; set +a
+DRY_RUN=1 STATE_PATH=/tmp/state.json uv run sync.py
 ```
 
 Prints the exact `dataPoints` payload for each unsynced workout without writing
@@ -94,7 +119,7 @@ Ofelia uses a 6-field cron format: `second minute hour day month weekday`.
 
 ## How It Works
 
-1. Refreshes OAuth access token
+1. Refreshes both OAuth access tokens (Gmail and Health separately)
 2. Searches Gmail for Lionheart report emails from the last 7 days
 3. Parses workout details (class name, time, studio, points, BPM) from email snippets
 4. Calculates estimated calories using the Keytel formula
@@ -109,9 +134,10 @@ Ofelia uses a 6-field cron format: `second minute hour day month weekday`.
 | 3 calls per workout (activity segment dataset, calories dataset, session) | 1 call per workout |
 | `dataSources` had to be created up front | no data source scaffolding — attribution is automatic |
 | nanosecond epoch timestamps | RFC 3339 timestamps plus a UTC-offset Duration |
-| `activityType: 113` | `exerciseType: HIGH_INTENSITY_INTERVAL_TRAINING` |
+| `activityType: 113` | `exerciseType: HIIT` |
 | calories as a separate `com.google.calories.expended` stream | `metricsSummary.caloriesKcal` on the session |
 | deterministic session ID gave server-side idempotency | server assigns the name; dedup is local-only (state file) |
+| one token covered Gmail + Fit | two tokens — Health refuses any token carrying Gmail scopes |
 
 Max BPM and Lionheart points have no dedicated fields in the exercise schema, so
 they are written into the session `notes` alongside the rest of the summary.
